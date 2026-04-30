@@ -6,10 +6,8 @@ import yt_dlp
 import aiohttp
 from functools import partial
 
-# Temporary storage for download requests (Spotify flow)
 download_requests = {}
 
-# Regular expression – catches any supported link
 URL_REGEX = re.compile(
     r'https?://(?:www\.)?(?:'
     r'open\.spotify\.com/|'
@@ -30,14 +28,12 @@ def is_spotify_url(url: str) -> bool:
 @Client.on_message(filters.text & filters.regex(URL_REGEX))
 async def on_music_link(client, message):
     url = message.matches[0].group()
-
     if is_spotify_url(url):
         await handle_spotify_link(client, message, url)
     else:
         await handle_ytdlp_fallback(client, message, url)
 
 async def handle_spotify_link(client, message, url):
-    """Process Spotify links with spotdl (rich metadata + 320kbps/128kbps options)."""
     if not spotdl:
         await message.reply_text("❌ Spotify credentials not configured. Only non‑Spotify links are supported.")
         return
@@ -52,7 +48,6 @@ async def handle_spotify_link(client, message, url):
         await message.reply_text("❌ No track found at that link.")
         return
 
-    # Playlist / Album handling
     if len(songs) > 1:
         await message.reply_text(
             f"📁 **Playlist/Album with {len(songs)} tracks found.**\n"
@@ -73,7 +68,6 @@ async def handle_spotify_link(client, message, url):
         "Choose quality:"
     )
 
-    # Download album art for thumbnail
     thumb = None
     if song.album_art_url:
         try:
@@ -97,7 +91,6 @@ async def handle_spotify_link(client, message, url):
     download_requests[req_id]["chat_id"] = message.chat.id
 
 def build_playlist_keyboard(songs, per_page=10):
-    """Inline keyboard for playlist/album."""
     buttons = []
     for idx, song in enumerate(songs[:per_page]):
         req_id = uuid.uuid4().hex
@@ -114,29 +107,26 @@ def format_duration(seconds):
     mins, secs = divmod(int(seconds), 60)
     return f"{mins}:{secs:02d}"
 
-# ── yt-dlp fallback handler ──
+# ── yt-dlp fallback (now m4a) ──
 
 async def handle_ytdlp_fallback(client, message, url):
-    """Download audio from non‑Spotify platforms using yt‑dlp and send it directly."""
     progress_msg = await message.reply_text("🔍 **Analyzing link...**")
 
-    # yt‑dlp options
     ydl_opts = {
-        'format': 'bestaudio/best',
+        'format': 'bestaudio[ext=m4a]/bestaudio/best',   # prefer m4a, then any best audio
         'outtmpl': 'downloads/%(title).100s.%(ext)s',
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '320',
+            'preferredcodec': 'm4a',                     # m4a output
+            'preferredquality': '320',                   # highest AAC bitrate
         }],
         'quiet': True,
         'no_warnings': True,
-        'noplaylist': True,      # single track only for simplicity
+        'noplaylist': True,
     }
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()   # ← fixed event loop
     try:
-        # Run blocking yt-dlp extraction in a thread pool to avoid blocking the event loop
         info = await loop.run_in_executor(
             None,
             partial(_sync_extract, ydl_opts, url)
@@ -149,13 +139,13 @@ async def handle_ytdlp_fallback(client, message, url):
         await progress_msg.edit_text("❌ Could not extract any audio from this link.")
         return
 
-    # Path after extraction and conversion
+    # Determine the final file name (yt-dlp may have changed extension to .m4a)
     filename = yt_dlp.YoutubeDL(ydl_opts).prepare_filename(info)
-    mp3_filename = filename.rsplit('.', 1)[0] + '.mp3'
+    # After postprocessing, the extension will be .m4a even if original was .webm
+    audio_path = filename.rsplit('.', 1)[0] + '.m4a'
 
     await progress_msg.edit_text("📤 **Uploading...**")
 
-    # Determine thumbnail if available
     thumb = None
     thumbnail_url = info.get('thumbnail')
     if thumbnail_url:
@@ -167,28 +157,26 @@ async def handle_ytdlp_fallback(client, message, url):
         except:
             pass
 
-    # Send as audio
+    bot_username = (await client.get_me()).username
     try:
         await client.send_audio(
             chat_id=message.chat.id,
-            audio=mp3_filename,
+            audio=audio_path,
             title=info.get('title', 'Unknown'),
             performer=info.get('uploader', 'Unknown'),
             duration=int(info.get('duration', 0)),
             thumb=thumb,
-            caption=f"🎵 **{info.get('title', 'Unknown')}**\n👤 {info.get('uploader', 'Unknown')}\n✨ Downloaded by @{(await client.get_me()).username}",
-            file_name=f"{info.get('uploader', 'Unknown')} - {info.get('title', 'Unknown')}.mp3"
+            caption=f"🎵 **{info.get('title', 'Unknown')}**\n👤 {info.get('uploader', 'Unknown')}\n✨ Downloaded by @{bot_username}",
+            file_name=f"{info.get('uploader', 'Unknown')} - {info.get('title', 'Unknown')}.m4a"
         )
     finally:
-        # Clean up
         try:
-            os.remove(mp3_filename)
+            os.remove(audio_path)
         except:
             pass
 
     await progress_msg.delete()
 
 def _sync_extract(ydl_opts, url):
-    """Synchronous extraction function to be run in a thread."""
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=True)
