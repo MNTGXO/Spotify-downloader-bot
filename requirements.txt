@@ -3,3 +3,4 @@ tgcrypto
 spotdl
 python-dotenv
 aiohttp
+yt-dlp
