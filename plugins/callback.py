@@ -4,11 +4,14 @@ from pyrogram import Client
 from pyrogram.types import CallbackQuery
 
 from plugins.download import (
+    DRMProtectedError,
     download_generic,
     download_spotify,
     fetch_thumb,
     is_spotify_url,
+    is_apple_music_url,
     pending_requests,
+    uses_spotdl,
 )
 from plugins.spotify_client import spotdl
 
@@ -43,22 +46,27 @@ async def callback_handler(client, callback_query: CallbackQuery):
     await callback_query.answer("Downloading...")
     await callback_query.message.edit_text("⏬ Downloading, please wait...")
 
+    path = None
     try:
-        if is_spotify_url(url):
+        if uses_spotdl(url):
+            # Covers both Spotify and Apple Music
             if not spotdl:
-                raise RuntimeError("Spotify credentials are missing on the server")
+                raise RuntimeError("Spotify/Apple Music credentials are missing on the server.")
+
             songs = await spotdl.search([url])
             if not songs:
-                raise RuntimeError("No track found for this Spotify URL")
+                raise RuntimeError("No track found for this URL.")
 
             song = songs[0]
             use_format = "mp3" if output_format == "best" else output_format
             use_quality = "320" if quality == "best" else quality
+
             path = await download_spotify(song, use_format, use_quality)
             title = song.name
             performer = song.artist
             duration = int(song.duration or 0)
             thumb = await fetch_thumb(song.album_art_url)
+
         else:
             info, path = await download_generic(url, output_format, quality)
             title = info.get("title", "Unknown")
@@ -66,12 +74,12 @@ async def callback_handler(client, callback_query: CallbackQuery):
             duration = int(info.get("duration", 0) or 0)
             thumb = await fetch_thumb(info.get("thumbnail"))
 
-        ext = os.path.splitext(path)[1].lstrip(".") or "audio"
+        ext = os.path.splitext(str(path))[1].lstrip(".") or "audio"
         caption = f"🎵 **{title}**\n👤 {performer}\n📦 {ext.upper()}"
 
         await client.send_audio(
             chat_id=callback_query.message.chat.id,
-            audio=path,
+            audio=str(path),
             title=title,
             performer=performer,
             duration=duration,
@@ -80,11 +88,16 @@ async def callback_handler(client, callback_query: CallbackQuery):
             file_name=f"{performer} - {title}.{ext}",
         )
         await callback_query.message.delete()
+
+    except DRMProtectedError as exc:
+        await callback_query.message.edit_text(f"🔒 {exc}")
+
     except Exception as exc:
         await callback_query.message.edit_text(f"❌ Download failed: {exc}")
+
     finally:
         try:
-            if "path" in locals() and os.path.exists(path):
-                os.remove(path)
+            if path and os.path.exists(str(path)):
+                os.remove(str(path))
         except Exception:
             pass
