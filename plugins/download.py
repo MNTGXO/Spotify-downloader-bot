@@ -65,7 +65,7 @@ async def handle_spotify_link(client, message, url):
         f"👤 {song.artist}\n"
         f"💿 {song.album_name} ({song.date.year if song.date else '?'})\n"
         f"⏱ {format_duration(song.duration) if song.duration else 'N/A'}\n\n"
-        "Choose quality:"
+        "📦 High‑quality **m4a** (AAC)"
     )
 
     thumb = None
@@ -82,8 +82,7 @@ async def handle_spotify_link(client, message, url):
         photo=thumb if thumb else "https://i.imgur.com/CqXrA0A.png",
         caption=caption,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎧 Download 320kbps", callback_data=f"dl_{req_id}_320"),
-             InlineKeyboardButton("🎧 Download 128kbps", callback_data=f"dl_{req_id}_128")],
+            [InlineKeyboardButton("🎧 Download m4a", callback_data=f"dl_{req_id}")],
             [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{req_id}")]
         ])
     )
@@ -97,7 +96,7 @@ def build_playlist_keyboard(songs, per_page=10):
         download_requests[req_id] = {"song": song}
         buttons.append([InlineKeyboardButton(
             f"{idx+1}. {song.name[:35]}...",
-            callback_data=f"dl_{req_id}_320"
+            callback_data=f"dl_{req_id}"
         )])
     return InlineKeyboardMarkup(buttons)
 
@@ -107,25 +106,25 @@ def format_duration(seconds):
     mins, secs = divmod(int(seconds), 60)
     return f"{mins}:{secs:02d}"
 
-# ── yt-dlp fallback (now m4a) ──
+# ── yt-dlp fallback (still m4a) ──
 
 async def handle_ytdlp_fallback(client, message, url):
     progress_msg = await message.reply_text("🔍 **Analyzing link...**")
 
     ydl_opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio/best',   # prefer m4a, then any best audio
+        'format': 'bestaudio[ext=m4a]/bestaudio/best',
         'outtmpl': 'downloads/%(title).100s.%(ext)s',
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'm4a',                     # m4a output
-            'preferredquality': '320',                   # highest AAC bitrate
+            'preferredcodec': 'm4a',
+            'preferredquality': '320',
         }],
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
     }
 
-    loop = asyncio.get_running_loop()   # ← fixed event loop
+    loop = asyncio.get_running_loop()
     try:
         info = await loop.run_in_executor(
             None,
@@ -139,9 +138,7 @@ async def handle_ytdlp_fallback(client, message, url):
         await progress_msg.edit_text("❌ Could not extract any audio from this link.")
         return
 
-    # Determine the final file name (yt-dlp may have changed extension to .m4a)
     filename = yt_dlp.YoutubeDL(ydl_opts).prepare_filename(info)
-    # After postprocessing, the extension will be .m4a even if original was .webm
     audio_path = filename.rsplit('.', 1)[0] + '.m4a'
 
     await progress_msg.edit_text("📤 **Uploading...**")
