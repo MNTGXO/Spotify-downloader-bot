@@ -1,8 +1,8 @@
+import asyncio
 import logging
 import os
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from aiohttp import web
 from dotenv import load_dotenv
 from pyrogram import Client, idle
 
@@ -20,49 +20,51 @@ logging.basicConfig(
 logger = logging.getLogger("music_downloader_bot")
 
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"Bot is alive!")
-
-    def log_message(self, format, *args):
-        return
+async def health_check(request):
+    return web.Response(text="Bot is alive!")
 
 
-def start_health_server():
+async def start_web_server():
     port = int(os.environ.get("PORT", "8080"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    web_app = web.Application()
+    web_app.router.add_get("/", health_check)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
     logger.info("Health check server started on port %s", port)
-    return server
+    return runner
 
 
-app = Client(
-    "music_downloader_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    plugins=dict(root="plugins"),
-)
+async def run_bot():
+    app = Client(
+        "music_downloader_bot",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN,
+        plugins=dict(root="plugins"),
+    )
 
-
-if __name__ == "__main__":
-    health_server = start_health_server()
-    app.start()
+    runner = await start_web_server()
+    await app.start()
     logger.info("Bot started")
 
     try:
-        me = app.get_me()
-        app.send_message(
+        me = await app.get_me()
+        await app.send_message(
             OWNER_NOTIFY_ID,
             f"✅ {me.first_name} restarted successfully and is now online.",
         )
+        logger.info("Startup notification sent to %s", OWNER_NOTIFY_ID)
     except Exception as exc:
         logger.warning("Startup notification failed: %s", exc)
 
-    idle()
-    app.stop()
-    health_server.shutdown()
+    try:
+        await idle()
+    finally:
+        await app.stop()
+        await runner.cleanup()
+
+
+if __name__ == "__main__":
+    asyncio.run(run_bot())
