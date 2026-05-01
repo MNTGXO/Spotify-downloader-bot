@@ -1,179 +1,477 @@
-import re, uuid, os, asyncio
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from plugins.spotify_client import spotdl
-import yt_dlp
-import aiohttp
+import asyncio
+import logging
+import os
+import re
+import uuid
 from functools import partial
+from pathlib import Path
 
-download_requests = {}
+import aiohttp
+import yt_dlp
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+from plugins.spotify_client import spotdl
+
+logger = logging.getLogger(__name__)
+
+pending_requests = {}
 
 URL_REGEX = re.compile(
-    r'https?://(?:www\.)?(?:'
-    r'open\.spotify\.com/|'
-    r'spotify\.link/|'
-    r'music\.youtube\.com/|'
-    r'youtube\.com/|'
-    r'youtu\.be/|'
-    r'soundcloud\.com/|'
-    r'deezer\.com/|'
-    r'music\.apple\.com/'
-    r').*',
-    re.IGNORECASE
+    r"https?://(?:www\.)?(?:"
+    r"open\.spotify\.com/|"
+    r"spotify\.link/|"
+    r"music\.youtube\.com/|"
+    r"youtube\.com/|"
+    r"youtu\.be/|"
+    r"soundcloud\.com/|"
+    r"deezer\.com/|"
+    r"music\.apple\.com/"
+    r").*",
+    re.IGNORECASE,
 )
 
+# ── URL classifiers ────────────────────────────────────────────────────────────
+
 def is_spotify_url(url: str) -> bool:
-    return any(domain in url for domain in ["open.spotify.com", "spotify.link"])
+    return "open.spotify.com" in url or "spotify.link" in url
+
+def is_apple_music_url(url: str) -> bool:
+    return "music.apple.com" in url
+
+def is_deezer_url(url: str) -> bool:
+    return "deezer.com" in url
+
+def uses_spotdl(url: str) -> bool:
+    """Routes that spotdl handles natively (Spotify + Apple Music)."""
+    return is_spotify_url(url) or is_apple_music_url(url)
+
+# ── Telegram handler ───────────────────────────────────────────────────────────
 
 @Client.on_message(filters.text & filters.regex(URL_REGEX))
 async def on_music_link(client, message):
     url = message.matches[0].group()
-    if is_spotify_url(url):
-        await handle_spotify_link(client, message, url)
-    else:
-        await handle_ytdlp_fallback(client, message, url)
+    req_id = uuid.uuid4().hex
+    pending_requests[req_id] = {"url": url, "chat_id": message.chat.id}
 
-async def handle_spotify_link(client, message, url):
-    if not spotdl:
-        await message.reply_text("❌ Spotify credentials not configured. Only non‑Spotify links are supported.")
-        return
+    await message.reply_text(
+        "🎚 Choose output format / quality:",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("MP3 320", callback_data=f"d_mp3_320_{req_id}"),
+                    InlineKeyboardButton("MP3 128", callback_data=f"d_mp3_128_{req_id}"),
+                ],
+                [
+                    InlineKeyboardButton("M4A High", callback_data=f"d_m4a_256_{req_id}"),
+                    InlineKeyboardButton("M4A Low", callback_data=f"d_m4a_128_{req_id}"),
+                ],
+                [InlineKeyboardButton("Best available", callback_data=f"d_best_best_{req_id}")],
+            ]
+        ),
+    )
 
+# ── Thumbnail helper ───────────────────────────────────────────────────────────
+
+async def fetch_thumb(url: str):
+    if not url:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=20) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+    except Exception:
+        return None
+    return None
+
+# ── Song metadata sanitiser ────────────────────────────────────────────────────
+
+class _MissingType:
+    pass
+
+_MISSING = _MissingType()
+
+
+def _sanitise_song(song) -> None:
+    """Patch missing/None metadata fields on a spotdl Song in-place (Fix #3)."""
+    defaults = {
+        "genres": [],
+        "disc_number": 1,
+        "disc_count": 1,
+        "copyright_text": "",
+        "download_url": None,
+        "lyrics": None,
+        "popularity": 0,
+        "album_id": "",
+        "album_artist": "",
+    }
+    for field, default in defaults.items():
+        try:
+            val = getattr(song, field, _MISSING)
+            if val is _MISSING or val is None:
+                object.__setattr__(song, field, default)
+        except Exception:
+            pass  # frozen dataclass – best-effort only
+
+# ── DRM error type ─────────────────────────────────────────────────────────────
+
+class DRMProtectedError(RuntimeError):
+    """Raised when the requested track is DRM-protected."""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STAGE 1 — spotdl
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def download_spotify(song, output_format: str, quality: str) -> Path:
+    """
+    Download a pre-resolved spotdl Song object.
+    Fixes #3 (genres) and #5 (None path).
+    """
+    _sanitise_song(song)
+
+    kwargs: dict = {"output_format": output_format}
+    if output_format in {"mp3", "m4a"} and str(quality).isdigit():
+        kwargs["bitrate"] = f"{quality}k"
+
+    try:
+        results = await spotdl.download(song, **kwargs)
+    except Exception as exc:
+        raise RuntimeError(f"spotdl download error: {exc}") from exc
+
+    if not results:
+        raise RuntimeError("spotdl returned an empty result list.")
+
+    _, file_path = results[0]
+
+    if file_path is None:
+        raise RuntimeError(
+            "spotdl could not save the file. "
+            "The track may be unavailable in your region or the output directory is not writable."
+        )
+
+    resolved = Path(file_path)
+    if not resolved.exists():
+        raise RuntimeError(f"Expected output file not found on disk: {resolved}")
+
+    return resolved
+
+
+async def download_spotdl_by_url(url: str, output_format: str, quality: str) -> Path:
+    """Search + download via spotdl (used by the unified entry-point)."""
     try:
         songs = await spotdl.search([url])
-    except Exception as e:
-        await message.reply_text(f"⚠️ Could not fetch track info: {e}")
-        return
+    except Exception as exc:
+        raise RuntimeError(f"spotdl search failed: {exc}") from exc
 
     if not songs:
-        await message.reply_text("❌ No track found at that link.")
-        return
+        raise RuntimeError("spotdl could not find any tracks for that URL.")
 
-    if len(songs) > 1:
-        await message.reply_text(
-            f"📁 **Playlist/Album with {len(songs)} tracks found.**\n"
-            "Tap a track to download it.",
-            reply_markup=build_playlist_keyboard(songs)
-        )
-        return
+    return await download_spotify(songs[0], output_format, quality)
 
-    song = songs[0]
-    req_id = uuid.uuid4().hex
-    download_requests[req_id] = {"song": song}
+# ═══════════════════════════════════════════════════════════════════════════════
+# STAGE 2 — yt-dlp
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    caption = (
-        f"🎵 **{song.name}**\n"
-        f"👤 {song.artist}\n"
-        f"💿 {song.album_name} ({song.date.year if song.date else '?'})\n"
-        f"⏱ {format_duration(song.duration) if song.duration else 'N/A'}\n\n"
-        "📦 High‑quality **m4a** (AAC)"
-    )
+_YT_COOKIE_FILE: str = "plugins/mnbot/youtube.txt"
+_YT_COOKIE_BROWSER: str | None = None  # using cookie file; no browser needed
 
-    thumb = None
-    if song.album_art_url:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(song.album_art_url) as resp:
-                    if resp.status == 200:
-                        thumb = await resp.read()
-        except:
-            pass
 
-    sent = await message.reply_photo(
-        photo=thumb if thumb else "https://i.imgur.com/CqXrA0A.png",
-        caption=caption,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎧 Download m4a", callback_data=f"dl_{req_id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{req_id}")]
-        ])
-    )
-    download_requests[req_id]["message_id"] = sent.id
-    download_requests[req_id]["chat_id"] = message.chat.id
-
-def build_playlist_keyboard(songs, per_page=10):
-    buttons = []
-    for idx, song in enumerate(songs[:per_page]):
-        req_id = uuid.uuid4().hex
-        download_requests[req_id] = {"song": song}
-        buttons.append([InlineKeyboardButton(
-            f"{idx+1}. {song.name[:35]}...",
-            callback_data=f"dl_{req_id}"
-        )])
-    return InlineKeyboardMarkup(buttons)
-
-def format_duration(seconds):
-    if not seconds:
-        return "0:00"
-    mins, secs = divmod(int(seconds), 60)
-    return f"{mins}:{secs:02d}"
-
-# ── yt-dlp fallback (still m4a) ──
-
-async def handle_ytdlp_fallback(client, message, url):
-    progress_msg = await message.reply_text("🔍 **Analyzing link...**")
-
-    ydl_opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio/best',
-        'outtmpl': 'downloads/%(title).100s.%(ext)s',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'm4a',
-            'preferredquality': '320',
-        }],
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
+def _build_ydl_opts(output_format: str, quality: str) -> dict:
+    opts: dict = {
+        "format": "bestaudio/best",
+        "outtmpl": "downloads/%(title).100s.%(ext)s",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "extractor_args": {
+            "youtube": {
+                "skip": ["hls", "dash"],
+                "player_skip": ["configs"],
+            }
+        },
     }
 
-    loop = asyncio.get_running_loop()
-    try:
-        info = await loop.run_in_executor(
-            None,
-            partial(_sync_extract, ydl_opts, url)
-        )
-    except Exception as e:
-        await progress_msg.edit_text(f"❌ Failed to process link: {e}")
-        return
+    if _YT_COOKIE_FILE and os.path.isfile(_YT_COOKIE_FILE):
+        opts["cookiefile"] = _YT_COOKIE_FILE
+    elif _YT_COOKIE_BROWSER:
+        opts["cookiesfrombrowser"] = (_YT_COOKIE_BROWSER,)
 
-    if info is None:
-        await progress_msg.edit_text("❌ Could not extract any audio from this link.")
-        return
+    if output_format in {"mp3", "m4a"}:
+        opts["postprocessors"] = [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": output_format,
+                "preferredquality": quality if quality.isdigit() else "0",
+            }
+        ]
 
-    filename = yt_dlp.YoutubeDL(ydl_opts).prepare_filename(info)
-    audio_path = filename.rsplit('.', 1)[0] + '.m4a'
+    return opts
 
-    await progress_msg.edit_text("📤 **Uploading...**")
 
-    thumb = None
-    thumbnail_url = info.get('thumbnail')
-    if thumbnail_url:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(thumbnail_url) as resp:
-                    if resp.status == 200:
-                        thumb = await resp.read()
-        except:
-            pass
-
-    bot_username = (await client.get_me()).username
-    try:
-        await client.send_audio(
-            chat_id=message.chat.id,
-            audio=audio_path,
-            title=info.get('title', 'Unknown'),
-            performer=info.get('uploader', 'Unknown'),
-            duration=int(info.get('duration', 0)),
-            thumb=thumb,
-            caption=f"🎵 **{info.get('title', 'Unknown')}**\n👤 {info.get('uploader', 'Unknown')}\n✨ Downloaded by @{bot_username}",
-            file_name=f"{info.get('uploader', 'Unknown')} - {info.get('title', 'Unknown')}.m4a"
-        )
-    finally:
-        try:
-            os.remove(audio_path)
-        except:
-            pass
-
-    await progress_msg.delete()
-
-def _sync_extract(ydl_opts, url):
+def _sync_extract(ydl_opts: dict, url: str):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=True)
+
+
+async def download_generic(url: str, output_format: str, quality: str):
+    """Download via yt-dlp. Returns (info_dict, audio_path_str)."""
+    if is_deezer_url(url):
+        raise DRMProtectedError(
+            "Deezer tracks are DRM-protected and cannot be downloaded. "
+            "Please use a Spotify or YouTube link instead."
+        )
+
+    ydl_opts = _build_ydl_opts(output_format, quality)
+    loop = asyncio.get_running_loop()
+
+    try:
+        info = await loop.run_in_executor(None, partial(_sync_extract, ydl_opts, url))
+    except yt_dlp.utils.DownloadError as exc:
+        msg = str(exc)
+        if "Sign in to confirm" in msg or "bot" in msg.lower():
+            raise RuntimeError(
+                "YouTube requires authentication for this video.\n"
+                "Add your Netscape cookies to plugins/mnbot/youtube.txt and restart the bot.\n"
+                "See https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp"
+            ) from exc
+        if "[DRM]" in msg:
+            raise DRMProtectedError(
+                "This track is DRM-protected and cannot be downloaded."
+            ) from exc
+        raise RuntimeError(f"Download failed: {msg}") from exc
+
+    if info is None:
+        raise RuntimeError("No downloadable audio was extracted.")
+
+    filename = yt_dlp.YoutubeDL(ydl_opts).prepare_filename(info)
+    audio_path = (
+        filename.rsplit(".", 1)[0] + f".{output_format}"
+        if output_format in {"mp3", "m4a"}
+        else filename
+    )
+    return info, audio_path
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STAGE 3 — SpotiFLAC API
+#
+# How it works (mirroring the FastAPI server's own logic):
+#   1. POST /api/download  → receive job_id
+#   2. Poll  GET /api/status/{job_id} every POLL_INTERVAL seconds
+#      until status == "completed" or "failed" (or timeout)
+#   3. The server writes FLAC files to MUSIC_DIR on its own filesystem.
+#      We fetch each file over HTTP via a companion /files/ static route
+#      (see SPOTIFLAC_FILE_BASE_URL) and save it locally under downloads/.
+#
+# Required env vars (set in your .env / Docker environment):
+#   SPOTIFLAC_API_URL      — e.g. http://localhost:9118
+#   SPOTIFLAC_FILE_BASE_URL — e.g. http://localhost:9118/files
+#                            The server must serve MUSIC_DIR at this path.
+#                            If the bot and API share a filesystem you can
+#                            set SPOTIFLAC_SHARED_FS=1 and skip the HTTP fetch.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SPOTIFLAC_API_URL: str | None = os.getenv("SPOTIFLAC_API_URL")          # http://host:9118
+_SPOTIFLAC_FILE_BASE: str | None = os.getenv("SPOTIFLAC_FILE_BASE_URL")  # http://host:9118/files
+_SPOTIFLAC_SHARED_FS: bool = os.getenv("SPOTIFLAC_SHARED_FS", "0") == "1"
+
+_POLL_INTERVAL: float = 5.0    # seconds between status checks
+_POLL_TIMEOUT: float  = 600.0  # give up after 10 minutes
+
+
+async def _spotiflac_available() -> bool:
+    """Quick health-check so we skip the fallback when the server is down."""
+    if not _SPOTIFLAC_API_URL:
+        return False
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                f"{_SPOTIFLAC_API_URL}/health", timeout=aiohttp.ClientTimeout(total=5)
+            ) as r:
+                return r.status == 200
+    except Exception:
+        return False
+
+
+async def download_spotiflac(url: str, output_format: str) -> Path:
+    """
+    Submit a download job to the SpotiFLAC API, poll until done,
+    then return a local Path to the downloaded FLAC (or converted) file.
+
+    output_format is noted for the caller but SpotiFLAC always produces FLAC;
+    conversion happens after this function returns if the caller needs MP3/M4A.
+    """
+    if not _SPOTIFLAC_API_URL:
+        raise RuntimeError("SPOTIFLAC_API_URL is not configured.")
+
+    # ── 1. Submit job ──────────────────────────────────────────────────────────
+    payload = {
+        "url": url,
+        "output_subdir": "bot_downloads",
+        "services": ["qobuz", "amazon", "tidal"],  # API's own priority order
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{_SPOTIFLAC_API_URL}/api/download",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"SpotiFLAC API rejected request ({resp.status}): {text[:300]}")
+            data = await resp.json()
+
+    job_id: str = data["job_id"]
+    logger.info("SpotiFLAC job queued: %s for %s", job_id, url)
+
+    # ── 2. Poll until completed / failed / timeout ─────────────────────────────
+    deadline = asyncio.get_event_loop().time() + _POLL_TIMEOUT
+    files: list[str] = []
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            await asyncio.sleep(_POLL_INTERVAL)
+
+            async with session.get(
+                f"{_SPOTIFLAC_API_URL}/api/status/{job_id}",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                status_data = await resp.json()
+
+            status = status_data.get("status")
+            logger.debug("SpotiFLAC job %s: %s", job_id, status)
+
+            if status == "completed":
+                files = status_data.get("files", [])
+                break
+
+            if status == "failed":
+                error = status_data.get("error") or "unknown error"
+                raise RuntimeError(f"SpotiFLAC job failed: {error[:300]}")
+
+            if asyncio.get_event_loop().time() > deadline:
+                raise RuntimeError(
+                    f"SpotiFLAC job {job_id} timed out after {_POLL_TIMEOUT:.0f}s."
+                )
+
+    if not files:
+        raise RuntimeError("SpotiFLAC job completed but returned no files.")
+
+    # ── 3. Obtain the first FLAC file ──────────────────────────────────────────
+    remote_path = files[0]  # absolute path on the API server's filesystem
+
+    Path("downloads").mkdir(exist_ok=True)
+    local_path = Path("downloads") / Path(remote_path).name
+
+    if _SPOTIFLAC_SHARED_FS:
+        # Bot and API share the same filesystem — just use the path directly
+        resolved = Path(remote_path)
+        if not resolved.exists():
+            raise RuntimeError(f"Shared-FS: file not found at {remote_path}")
+        return resolved
+
+    # Fetch over HTTP using the file-serving base URL
+    if not _SPOTIFLAC_FILE_BASE:
+        raise RuntimeError(
+            "SPOTIFLAC_FILE_BASE_URL is not set. "
+            "Either set it to the URL where MUSIC_DIR is served, "
+            "or set SPOTIFLAC_SHARED_FS=1 if the bot shares the filesystem."
+        )
+
+    # Build download URL: strip MUSIC_DIR prefix to get the relative path
+    music_dir = os.getenv("SPOTIFLAC_MUSIC_DIR", "/music")
+    try:
+        rel = Path(remote_path).relative_to(music_dir)
+    except ValueError:
+        rel = Path(remote_path).name  # fallback: just the filename
+
+    file_url = f"{_SPOTIFLAC_FILE_BASE.rstrip('/')}/{rel}"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            file_url, timeout=aiohttp.ClientTimeout(total=300)
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(
+                    f"Could not fetch file from SpotiFLAC server ({resp.status}): {file_url}"
+                )
+            data = await resp.read()
+
+    local_path.write_bytes(data)
+    logger.info("SpotiFLAC: saved %s (%d bytes)", local_path, len(data))
+    return local_path
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Unified entry-point  (spotdl → yt-dlp → SpotiFLAC)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def download(url: str, output_format: str, quality: str) -> dict:
+    """
+    Try each downloader in order and return the first that succeeds.
+
+    Return dict:
+        path      : Path  – local file
+        title     : str
+        artist    : str
+        thumb_url : str | None
+        source    : str   – which backend delivered the file
+    """
+    errors: list[str] = []
+
+    # ── Stage 1: spotdl ────────────────────────────────────────────────────────
+    if uses_spotdl(url) and spotdl:
+        try:
+            file_path = await download_spotdl_by_url(url, output_format, quality)
+            logger.info("Downloaded via spotdl: %s", file_path)
+            return {
+                "path": file_path,
+                "title": file_path.stem,
+                "artist": "",
+                "thumb_url": None,
+                "source": "spotdl",
+            }
+        except DRMProtectedError:
+            raise  # DRM is fatal – don't fall through
+        except Exception as exc:
+            errors.append(f"spotdl: {exc}")
+            logger.warning("spotdl failed, trying yt-dlp. Reason: %s", exc)
+
+    # ── Stage 2: yt-dlp ────────────────────────────────────────────────────────
+    try:
+        info, audio_path = await download_generic(url, output_format, quality)
+        logger.info("Downloaded via yt-dlp: %s", audio_path)
+        return {
+            "path": Path(audio_path),
+            "title": info.get("title", "Unknown"),
+            "artist": info.get("uploader", ""),
+            "thumb_url": info.get("thumbnail"),
+            "source": "yt-dlp",
+        }
+    except DRMProtectedError:
+        raise  # DRM is fatal
+    except Exception as exc:
+        errors.append(f"yt-dlp: {exc}")
+        logger.warning("yt-dlp failed, trying SpotiFLAC. Reason: %s", exc)
+
+    # ── Stage 3: SpotiFLAC API ─────────────────────────────────────────────────
+    if not await _spotiflac_available():
+        errors.append("SpotiFLAC: server unreachable or SPOTIFLAC_API_URL not set")
+    else:
+        try:
+            file_path = await download_spotiflac(url, output_format)
+            logger.info("Downloaded via SpotiFLAC: %s", file_path)
+            return {
+                "path": file_path,
+                "title": file_path.stem,
+                "artist": "",
+                "thumb_url": None,
+                "source": "spotiflac",
+            }
+        except Exception as exc:
+            errors.append(f"SpotiFLAC: {exc}")
+            logger.error("SpotiFLAC also failed: %s", exc)
+
+    # ── All stages exhausted ───────────────────────────────────────────────────
+    summary = "\n".join(f"  • {e}" for e in errors)
+    raise RuntimeError(f"All download methods failed:\n{summary}")
