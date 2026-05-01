@@ -1,8 +1,8 @@
-import asyncio
 import logging
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from aiohttp import web
 from dotenv import load_dotenv
 from pyrogram import Client, idle
 
@@ -19,6 +19,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger("music_downloader_bot")
 
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", "8080"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info("Health check server started on port %s", port)
+    return server
+
+
 app = Client(
     "music_downloader_bot",
     api_id=API_ID,
@@ -28,40 +49,20 @@ app = Client(
 )
 
 
-async def health_check(request):
-    return web.Response(text="Bot is alive!")
+if __name__ == "__main__":
+    health_server = start_health_server()
+    app.start()
+    logger.info("Bot started")
 
-
-async def start_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    web_app = web.Application()
-    web_app.router.add_get("/", health_check)
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info("Health check server started on port %s", port)
-
-
-async def startup_notify():
     try:
-        me = await app.get_me()
-        await app.send_message(
+        me = app.get_me()
+        app.send_message(
             OWNER_NOTIFY_ID,
             f"✅ {me.first_name} restarted successfully and is now online.",
         )
     except Exception as exc:
         logger.warning("Startup notification failed: %s", exc)
 
-
-async def main():
-    await app.start()
-    logger.info("Bot started")
-    await start_web_server()
-    await startup_notify()
-    await idle()
-    await app.stop()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    idle()
+    app.stop()
+    health_server.shutdown()
